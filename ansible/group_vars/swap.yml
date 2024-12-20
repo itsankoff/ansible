@@ -1,0 +1,9 @@
+# location of the swap file
+swap_file: /swapfile
+
+# size of the swap file in GB
+swap_size: 8G
+
+# swappiness option for the kernel. values from 0 to 100
+# less value, less swap used
+swappiness: 60 # default value for Linux kernels

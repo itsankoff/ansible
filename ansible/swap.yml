@@ -1,0 +1,57 @@
+---
+- name: Configure swap on servers
+  hosts: all
+  become: true
+  vars_files:
+    - group_vars/swap.yml
+
+  tasks:
+    - name: Check if swap is already enabled
+      command: swapon --show
+      register: swap_status
+      ignore_errors: true
+
+    - name: Create swap file if not enabled
+      command: fallocate -l {{ swap_size }} {{ swap_file }}
+      when: swap_status.stdout == ""
+      register: create_swap
+      failed_when: create_swap.rc != 0 and "fallocate" not in create_swap.stderr
+
+    - name: Use dd to create swap file if fallocate fails
+      command: dd if=/dev/zero of={{ swap_file }} bs=1G count={{ swap_size[:-1]|int }}
+      when: swap_status.stdout == "" and "fallocate" in create_swap.stderr
+
+    - name: Set correct permissions on the swap file
+      file:
+        path: "{{ swap_file }}"
+        owner: root
+        group: root
+        mode: '0600'
+      when: swap_status.stdout == ""
+
+    - name: Format the swap file
+      command: mkswap {{ swap_file }}
+      when: swap_status.stdout == ""
+
+    - name: Enable the swap file
+      command: swapon {{ swap_file }}
+      when: swap_status.stdout == ""
+
+    - name: Ensure swap configuration is persistent
+      lineinfile:
+        path: /etc/fstab
+        line: "{{ swap_file }} none swap sw 0 0"
+        state: present
+
+    - name: Set swappiness value
+      sysctl:
+        name: vm.swappiness
+        value: "{{ swappiness }}"
+        state: present
+
+    - name: Verify swap configuration
+      command: free -h
+      register: swap_verification
+
+    - debug:
+        msg: "Swap is enabled with size {{ swap_size }}. Verification: {{ swap_verification.stdout }}"
