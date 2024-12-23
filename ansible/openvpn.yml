@@ -1,0 +1,269 @@
+---
+# Ansible Playbook to Install OpenVPN Server and Manage Certificates
+- name: Install and Configure OpenVPN Server
+  hosts: vpn
+  become: true
+  vars_files:
+    - group_vars/openvpn.yml
+
+  tasks:
+    - name: Generation of PKI infrastructure using EasyRSA
+      block:
+        - name: Update and Install Prerequisites
+          apt:
+            update_cache: yes
+            name:
+              - openvpn
+              - easy-rsa
+            state: present
+
+        - name: Create Easy-RSA Directory
+          file:
+            path: "{{ easyrsa_dir }}"
+            state: directory
+            mode: '0755'
+
+        - name: Copy Easy-RSA Files
+          copy:
+            src: "{{ easy_rsa_source }}/"
+            dest: "{{ easyrsa_dir }}/"
+            directory_mode:
+            remote_src: yes
+
+        - name: Check if PKI directory exists
+          stat:
+            path: "{{ easyrsa_dir }}/pki"
+          register: pki_dir_stat
+
+        - name: Initialize Easy-RSA
+          command: "{{ easyrsa_dir }}/easyrsa init-pki"
+          args:
+            chdir: "{{ easyrsa_dir }}"
+          when: not pki_dir_stat.stat.exists
+
+        - name: Check if CA file exists
+          stat:
+            path: "{{ ca_cert_file }}"
+          register: ca_file_stat
+
+        - name: Build the CA (Certificate Authority)
+          expect:
+            command: "{{ easyrsa_dir }}/easyrsa build-ca nopass"
+            responses:
+              "Common Name.*": "{{ ca_common_name }}"
+          args:
+            chdir: "{{ easyrsa_dir }}"
+          when: not ca_file_stat.stat.exists
+
+        - name: Check if server private key exists
+          stat:
+            path: "{{ server_key_file }}"
+          register: server_key_stat
+
+        - name: Generate Server Certificate and Key
+          expect:
+            command: "{{ easyrsa_dir }}/easyrsa gen-req {{ openvpn_server_name }} nopass"
+            responses:
+              "Common Name.*": "{{ ca_common_name }}"
+          args:
+            chdir: "{{ easyrsa_dir }}"
+          when: not server_key_stat.stat.exists
+
+        - name: Check if server sign certificate exists
+          stat:
+            path: "{{ server_cert_file }}"
+          register: server_sign_stat
+
+        - name: Sign Server Certificate
+          expect:
+            command: "{{ easyrsa_dir }}/easyrsa sign-req server {{ openvpn_server_name }}"
+            responses:
+              "Confirm request details.*": "yes"
+          args:
+            chdir: "{{ easyrsa_dir }}"
+          when: not server_sign_stat.stat.exists
+          register: server_cert
+
+        - name: Check if diffie-hellman exists
+          stat:
+            path: "{{ dh_param_file }}"
+          register: dh_stat
+
+        - name: Generate Diffie-Hellman Key Exchange File
+          command: "{{ easyrsa_dir }}/easyrsa gen-dh"
+          args:
+            chdir: "{{ easyrsa_dir }}"
+          when: not dh_stat.stat.exists
+
+        - name: Check if TLS key exists
+          stat:
+            path: "{{ ta_key_file }}"
+          register: ta_key_stat
+
+        - name: Generate TLS authentication key (ta.key)
+          command: "openvpn --genkey --secret {{ ta_key_file }}"
+          when: not ta_key_stat.stat.exists
+
+    - name: Networking forwarding configuration
+      block:
+        - name: Check if FORWARD rule exists for tun0 to eth0
+          command: iptables -C FORWARD -i tun0 -o eth0 -j ACCEPT
+          ignore_errors: true
+          register: forward_tun0_to_eth0_rule
+
+        - name: Add FORWARD rule for tun0 to eth0
+          command: iptables -A FORWARD -i tun0 -o eth0 -j ACCEPT
+          when: forward_tun0_to_eth0_rule.rc != 0
+
+        - name: Check if FORWARD rule exists for eth0 to tun0
+          command: iptables -C FORWARD -i eth0 -o tun0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+          ignore_errors: true
+          register: forward_eth0_to_tun0_rule
+
+        - name: Add FORWARD rule for eth0 to tun0
+          command: iptables -A FORWARD -i eth0 -o tun0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+          when: forward_eth0_to_tun0_rule.rc != 0
+
+        - name: Check if POSTROUTING MASQUERADE rule exists for tun0
+          command: "iptables -t nat -C POSTROUTING -s {{ openvpn_network }}/24 -o eth0 -j MASQUERADE"
+          ignore_errors: true
+          register: postrouting_masquerade_rule
+
+        - name: Add POSTROUTING MASQUERADE rule for tun0
+          command: "iptables -t nat -A POSTROUTING -s {{ openvpn_network }}/24 -o eth0 -j MASQUERADE"
+          when: postrouting_masquerade_rule.rc != 0
+
+        - name: Save iptables rules
+          shell: iptables-save > /etc/iptables.rules
+
+        - name: Check if rc.local file exists
+          stat:
+            path: /etc/rc.local
+          register: rc_local_stat
+
+        - name: Create rc.local file
+          copy:
+            dest: /etc/rc.local
+            content: |
+              #!/bin/bash
+              iptables-restore < /etc/iptables.rules
+              exit 0
+            mode: '0755'
+          when: not rc_local_stat.stat.exists
+
+        - name: Ensure rc.local runs iptables-restore
+          lineinfile:
+            path: /etc/rc.local
+            line: "iptables-restore < /etc/iptables.rules"
+            state: present
+
+    - name: Configure OpenVPN Server
+      template:
+        src: openvpn_server.conf.j2
+        dest: "{{ openvpn_config_dir }}/server.conf"
+
+    - name: Enable and Start OpenVPN Service
+      systemd:
+        name: "{{ openvpn_service_name }}"
+        enabled: true
+        state: started
+
+- name: Generate Client Certificates
+  hosts: vpn
+  vars_files:
+    - group_vars/openvpn.yml
+
+  tasks:
+    - name: Check existing certificates for active users
+      stat:
+        path: "{{ easyrsa_dir }}/pki/issued/{{ item.name }}.crt"
+      register: cert_stat
+      loop: "{{ openvpn_users | selectattr('state', 'equalto', 'active') | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Issuing new client certificates
+      block:
+        - name: Generate client certificate requests for active users
+          expect:
+            command: "{{ easyrsa_dir }}/easyrsa gen-req {{ item.name }} nopass"
+            responses:
+              "Common Name.*": "{{ item.name }}"
+          args:
+            chdir: "{{ easyrsa_dir }}"
+          when: >
+            not (cert_stat.results | selectattr('item.name', 'equalto', item.name) | map(attribute='stat.exists') | first | default(false))
+          loop: "{{ openvpn_users | selectattr('state', 'equalto', 'active') | list }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: Sign client certificates for active users
+          expect:
+            command: "{{ easyrsa_dir }}/easyrsa sign-req client {{ item.name }}"
+            responses:
+              "Confirm.*": "yes"
+              "Enter.*passphrase.*": ""
+          args:
+            chdir: "{{ easyrsa_dir }}"
+          when: >
+            not (cert_stat.results | selectattr('item.name', 'equalto', item.name) | map(attribute='stat.exists') | first | default(false))
+          loop: "{{ openvpn_users | selectattr('state', 'equalto', 'active') | list }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: Fetch CA certificate
+          slurp:
+            src: "{{ ca_cert_file }}"
+          register: ca_cert
+
+        - name: Fetch client certificate
+          slurp:
+            src: "{{ easyrsa_dir }}/pki/issued/{{ item.name }}.crt"
+          register: client_cert
+          loop: "{{ openvpn_users | selectattr('state', 'equalto', 'active') | list }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: Fetch client private key
+          slurp:
+            src: "{{ easyrsa_dir }}/pki/private/{{ item.name }}.key"
+          register: client_key
+          loop: "{{ openvpn_users | selectattr('state', 'equalto', 'active') | list }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: Fetch TLS authentication key
+          slurp:
+            src: "{{ ta_key_file }}"
+          register: tls_auth_key
+
+        - name: Ensure client-configs dir exists
+          file:
+            path: "{{ client_cert_dir }}"
+            state: directory
+            mode: '0755'
+
+        - name: Generate portable OpenVPN client file
+          template:
+            src: openvpn_client.ovpn.j2
+            dest: "{{ client_cert_dir }}/{{ item.name }}.ovpn"
+          loop: "{{ openvpn_users | selectattr('state', 'equalto', 'active') | list }}"
+          loop_control:
+            label: "{{ item.name }}"
+          vars:
+            ca_cert_content: "{{ ca_cert.content | b64decode }}"
+            client_cert_content: >
+              {{ client_cert.results | selectattr('item.name', 'equalto', item.name) | map(attribute='content') | first | b64decode }}
+            client_key_content: >
+              {{ client_key.results | selectattr('item.name', 'equalto', item.name) | map(attribute='content') | first | b64decode }}
+            tls_auth_content: "{{ tls_auth_key.content | b64decode }}"
+      when: "{{ openvpn_users | selectattr('state', 'equalto', 'active') | list | length > 0 }}"
+
+    - name: Download client configuration files to the local files directory
+      fetch:
+        src: "{{ client_cert_dir }}/{{ item.name }}.ovpn"
+        dest: "./files/vpn-clients/{{ item.name }}.ovpn"
+        flat: yes
+      loop: "{{ openvpn_users | selectattr('state', 'equalto', 'active') | list }}"
+      loop_control:
+        label: "{{ item.name }}"

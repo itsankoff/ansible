@@ -1,0 +1,59 @@
+# OpenVPN client configuration file
+# This file is portable and includes all necessary keys and certificates.
+
+# Specify the client mode
+client
+
+# Use a TUN device for VPN (routed connection)
+dev tun
+
+# Protocol used for connection (udp or tcp)
+proto {{ openvpn_proto }}
+
+# Remote server address and port
+remote {{ openvpn_server_address }} {{ openvpn_port }}
+
+# Retry the connection infinitely in case of failures
+resolv-retry infinite
+
+# Don't bind to a specific local port (use a random port)
+nobind
+
+# Keep the encryption key and tunnel state between connections
+persist-key
+persist-tun
+
+# Verify the server certificate to ensure you're connecting to the right server
+remote-cert-tls server
+
+# Specify the cipher to use for encryption
+cipher AES-256-GCM
+
+# Enable compression if compatible with the server
+# comp-lzo
+
+# Set the verbosity level of logs (higher = more verbose, lower = less verbose)
+verb 3
+
+# Include the CA certificate to verify the server's identity
+<ca>
+{{ ca_cert_content }}
+</ca>
+
+# Include the client certificate to authenticate the client to the server
+<cert>
+{{ client_cert_content }}
+</cert>
+
+# Include the private key corresponding to the client certificate
+<key>
+{{ client_key_content }}
+</key>
+
+# Include the TLS authentication key for an extra layer of security
+<tls-auth>
+{{ tls_auth_content }}
+</tls-auth>
+
+# Specify the key direction for TLS authentication (1 for client)
+key-direction 1
